@@ -15,7 +15,7 @@ from transformers import (
     TrainerCallback,
     TrainingArguments,
 )
-from transformers.trainer_callback import PrinterCallback, ProgressCallback
+from transformers.trainer_callback import PrinterCallback
 from transformers.utils import logging as hf_logging
 
 from utils import (
@@ -140,7 +140,7 @@ def build_training_arguments(args) -> TrainingArguments:
         "seed": args.seed,
         "fp16": torch.cuda.is_available(),
         "report_to": "none",
-        "disable_tqdm": True,
+        "disable_tqdm": False,
         "dataloader_pin_memory": torch.cuda.is_available(),
     }
 
@@ -172,10 +172,15 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU name: {torch.cuda.get_device_name(0)}")
 
+    print("\nLoading datasets...")
     train_ds = build_dataset(train_file)
     val_ds = build_dataset(val_file)
     test_ds = build_dataset(test_file)
+    print(
+        f"Dataset sizes | train={len(train_ds)} | val={len(val_ds)} | test={len(test_ds)}"
+    )
 
+    print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
     # Tokenize raw text so the pretrained encoder can consume it.
@@ -186,10 +191,12 @@ def main():
             max_length=args.max_length,
         )
 
+    print("Tokenizing datasets...")
     train_ds = train_ds.map(preprocess_function, batched=True)
     val_ds = val_ds.map(preprocess_function, batched=True)
     test_ds = test_ds.map(preprocess_function, batched=True)
 
+    print("Loading RoBERTa classification model...")
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         num_labels=2,
@@ -224,7 +231,6 @@ def main():
 
     trainer = Trainer(**trainer_kwargs)
     trainer.remove_callback(PrinterCallback)
-    trainer.remove_callback(ProgressCallback)
 
     epoch_metrics_callback = next(
         callback
@@ -232,6 +238,7 @@ def main():
         if isinstance(callback, EpochMetricsCallback)
     )
 
+    print("\nStarting training...")
     trainer.train()
     epoch_metrics_callback.enabled = False
 
