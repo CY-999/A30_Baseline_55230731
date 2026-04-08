@@ -1,10 +1,12 @@
 import argparse
 import json
 import os
+import warnings
 from typing import List
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers.utils import logging as hf_logging
 
 from utils import load_records
 
@@ -13,6 +15,12 @@ LABEL_MAPPING = {
     0: "normal",
     1: "scam",
 }
+
+
+def configure_console_output() -> None:
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    hf_logging.set_verbosity_error()
+    warnings.filterwarnings("ignore")
 
 
 def parse_args():
@@ -58,6 +66,7 @@ def predict_texts(model, tokenizer, texts: List[str], max_length: int):
 
 
 def main():
+    configure_console_output()
     args = parse_args()
 
     if args.text is None and args.input_file is None:
