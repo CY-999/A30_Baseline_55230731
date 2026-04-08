@@ -1,17 +1,22 @@
 import argparse
+import inspect
 import os
+import warnings
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
-from datasets import Dataset
+from datasets import Dataset, disable_progress_bar
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
+from transformers.trainer_callback import PrinterCallback, ProgressCallback
+from transformers.utils import logging as hf_logging
 
 from utils import (
     compute_metrics_from_predictions,
@@ -20,6 +25,26 @@ from utils import (
     save_json,
     set_seed,
 )
+
+
+class EpochMetricsCallback(TrainerCallback):
+    def __init__(self, total_epochs: int):
+        self.total_epochs = total_epochs
+        self.enabled = True
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not self.enabled or not metrics:
+            return
+
+        epoch = int(round(state.epoch or 0))
+        summary = (
+            f"Epoch {epoch}/{self.total_epochs} | "
+            f"val_f1={metrics.get('eval_f1', 0.0):.4f} | "
+            f"val_precision={metrics.get('eval_precision', 0.0):.4f} | "
+            f"val_recall={metrics.get('eval_recall', 0.0):.4f} | "
+            f"val_acc={metrics.get('eval_accuracy', 0.0):.4f}"
+        )
+        print(summary)
 
 
 def parse_args():
@@ -76,8 +101,63 @@ def build_dataset(file_path: str) -> Dataset:
     return Dataset.from_dict({"text": texts, "label": labels})
 
 
+def configure_console_output() -> None:
+    disable_progress_bar()
+    hf_logging.disable_progress_bar()
+    hf_logging.set_verbosity_error()
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`tokenizer` is deprecated and will be removed in version 5\.0\.0 for `Trainer\.__init__`.*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Was asked to gather along dimension 0, but all input tensors were scalars.*",
+        category=UserWarning,
+    )
+
+
+def select_core_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    keys = ("eval_accuracy", "eval_precision", "eval_recall", "eval_f1")
+    return {k: float(metrics[k]) for k in keys if k in metrics}
+
+
+def build_training_arguments(args) -> TrainingArguments:
+    signature = inspect.signature(TrainingArguments.__init__)
+    kwargs = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "num_train_epochs": args.epochs,
+        "weight_decay": args.weight_decay,
+        "save_strategy": "epoch",
+        "logging_strategy": "no",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "f1",
+        "greater_is_better": True,
+        "save_total_limit": 2,
+        "seed": args.seed,
+        "fp16": torch.cuda.is_available(),
+        "report_to": "none",
+        "disable_tqdm": True,
+        "dataloader_pin_memory": torch.cuda.is_available(),
+    }
+
+    if "overwrite_output_dir" in signature.parameters:
+        kwargs["overwrite_output_dir"] = True
+
+    if "evaluation_strategy" in signature.parameters:
+        kwargs["evaluation_strategy"] = "epoch"
+    elif "eval_strategy" in signature.parameters:
+        kwargs["eval_strategy"] = "epoch"
+
+    return TrainingArguments(**kwargs)
+
+
 def main():
     args = parse_args()
+    configure_console_output()
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
     train_file, val_file, test_file = resolve_data_files(args)
@@ -124,47 +204,44 @@ def main():
 
     best_model_dir = os.path.join(args.output_dir, "best_model")
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        overwrite_output_dir=True,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        num_train_epochs=args.epochs,
-        weight_decay=args.weight_decay,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        logging_strategy="steps",
-        logging_steps=10,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1",
-        greater_is_better=True,
-        save_total_limit=2,
-        seed=args.seed,
-        fp16=torch.cuda.is_available(),
-        report_to="none",
-    )
+    training_args = build_training_arguments(args)
 
     # Trainer handles the train, eval, and checkpoint loop for this baseline.
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_ds,
+        "eval_dataset": val_ds,
+        "data_collator": data_collator,
+        "compute_metrics": compute_metrics,
+        "callbacks": [EpochMetricsCallback(total_epochs=args.epochs)],
+    }
+    trainer_signature = inspect.signature(Trainer.__init__)
+    if "processing_class" in trainer_signature.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = Trainer(**trainer_kwargs)
+    trainer.remove_callback(PrinterCallback)
+    trainer.remove_callback(ProgressCallback)
+
+    epoch_metrics_callback = next(
+        callback
+        for callback in trainer.callback_handler.callbacks
+        if isinstance(callback, EpochMetricsCallback)
     )
 
     trainer.train()
+    epoch_metrics_callback.enabled = False
 
     print("\nEvaluating on validation set...")
     val_metrics = trainer.evaluate(eval_dataset=val_ds)
-    pretty_print_metrics("Validation", {k: v for k, v in val_metrics.items() if isinstance(v, (float, int))})
+    pretty_print_metrics("Validation", select_core_metrics(val_metrics))
 
     print("\nEvaluating on test set...")
     test_metrics = trainer.evaluate(eval_dataset=test_ds)
-    filtered_test_metrics = {k: v for k, v in test_metrics.items() if isinstance(v, (float, int))}
+    filtered_test_metrics = select_core_metrics(test_metrics)
     pretty_print_metrics("Test", filtered_test_metrics)
 
     trainer.save_model(best_model_dir)

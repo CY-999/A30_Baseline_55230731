@@ -1,0 +1,22 @@
+{
+  "input_file": "D:\\桌面\\服务外包大赛\\A30_Baseline_55230731\\data\\demo\\total.json",
+  "total_raw_records": 80000,
+  "total_valid_records": 80000,
+  "skipped_records": 0,
+  "group_count": 40000,
+  "train": {
+    "size": 64000,
+    "label_0_normal": 32000,
+    "label_1_scam": 32000
+  },
+  "val": {
+    "size": 8000,
+    "label_0_normal": 4000,
+    "label_1_scam": 4000
+  },
+  "test": {
+    "size": 8000,
+    "label_0_normal": 4000,
+    "label_1_scam": 4000
+  }
+}
